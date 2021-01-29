@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
+	"log"
 	"os"
 	"os/exec"
 	"sort"
@@ -25,6 +26,8 @@ import (
 
 	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
 )
+
+const Debug = 0
 
 func min(a, b uint64) uint64 {
 	if a > b {
@@ -126,4 +129,14 @@ func IsResponseMsg(msgt pb.MessageType) bool {
 
 func isHardStateEqual(a, b pb.HardState) bool {
 	return a.Term == b.Term && a.Vote == b.Vote && a.Commit == b.Commit
+}
+
+func (r *Raft) DPrintf(format string, a ...interface{}) (n int, err error) {
+	if Debug > 0 {
+		msg := fmt.Sprintf(format, a...)
+		first, _ := r.RaftLog.storage.FirstIndex()
+		log.Printf("Server %d (Term %d, %s, Lead %d, Applied %d, Commited %d, First %d, stableFirst %d):\n%s",
+			r.id, r.Term, stmap[r.State], r.Lead, r.RaftLog.applied, r.RaftLog.committed, r.RaftLog.FirstIndex, first, msg)
+	}
+	return
 }
