@@ -14,7 +14,10 @@
 
 package raft
 
-import pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
+import (
+	"github.com/pingcap-incubator/tinykv/log"
+	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
+)
 
 // RaftLog manage the log entries, its struct look like:
 //
@@ -45,6 +48,8 @@ type RaftLog struct {
 	// all entries that have not yet compact.
 	entries []pb.Entry
 
+	offset uint64
+
 	// the incoming unstable snapshot, if any.
 	// (Used in 2C)
 	pendingSnapshot *pb.Snapshot
@@ -56,7 +61,20 @@ type RaftLog struct {
 // to the state that it just commits and applies the latest snapshot.
 func newLog(storage Storage) *RaftLog {
 	// Your Code Here (2A).
-	return nil
+	sli, err := storage.LastIndex()
+	if err != nil {
+		panic(err)
+	}
+	sfi, err := storage.FirstIndex()
+	if err != nil {
+		panic(err)
+	}
+	ents, err := storage.Entries(sfi, sli+1)
+	if err != nil {
+		panic(err)
+	}
+	log.Infof("offset(first): %d  stabled(last): %d  ents: %v", sfi, sli, ents)
+	return &RaftLog{storage: storage, stabled: sli, entries: ents, offset: sfi}
 }
 
 // We need to compact the log entries in some point of time like
@@ -69,23 +87,137 @@ func (l *RaftLog) maybeCompact() {
 // unstableEntries return all the unstable entries
 func (l *RaftLog) unstableEntries() []pb.Entry {
 	// Your Code Here (2A).
-	return nil
+	if l.stabled+1 > l.LastIndex() {
+		// all entries is stabled
+		return make([]pb.Entry, 0)
+	}
+	ents, err := l.Slice(l.stabled+1, l.LastIndex()+1)
+	if err != nil {
+		panic(err)
+	}
+	return ents
 }
 
 // nextEnts returns all the committed but not applied entries
 func (l *RaftLog) nextEnts() (ents []pb.Entry) {
 	// Your Code Here (2A).
-	return nil
+	if l.applied+1 > l.LastIndex() {
+		// all entries is applied
+		return make([]pb.Entry, 0)
+	}
+	ents, err := l.Slice(l.applied+1, l.committed+1)
+	if err != nil {
+		panic(err)
+	}
+	return
+}
+
+func (l *RaftLog) append(entries ...pb.Entry) {
+	if len(entries) == 0 {
+		return
+	}
+	preIdx := entries[0].Index - 1
+	if preIdx < l.committed {
+		log.Panicf("Appending entries with index(%d) <= committed(%d) is invalid.", preIdx+1, l.committed)
+	}
+	if len(l.entries) > 0 {
+		switch {
+		case preIdx == l.offset+uint64(len(l.entries)-1):
+			l.entries = append(l.entries, entries...)
+		case preIdx < l.offset:
+			l.offset = preIdx + 1
+			l.entries = entries
+		default:
+			l.entries = append([]pb.Entry{}, l.entries[0:preIdx+1-l.offset]...)
+			l.entries = append(l.entries, entries...)
+		}
+	} else {
+		l.offset = preIdx + 1
+		l.entries = entries
+	}
+	if l.stabled > preIdx {
+		l.stabled = preIdx
+	}
 }
 
 // LastIndex return the last index of the log entries
 func (l *RaftLog) LastIndex() uint64 {
 	// Your Code Here (2A).
-	return 0
+	if entLen := len(l.entries); entLen > 0 {
+		return l.offset + uint64(entLen) - 1
+	}
+	i, err := l.storage.LastIndex()
+	if err != nil {
+		panic(err)
+	}
+	return i
+}
+
+func (l *RaftLog) LastTerm() uint64 {
+	term, err := l.Term(l.LastIndex())
+	if err != nil {
+		return 0
+	}
+	return term
 }
 
 // Term return the term of the entry in the given index
 func (l *RaftLog) Term(i uint64) (uint64, error) {
 	// Your Code Here (2A).
-	return 0, nil
+	if i > l.LastIndex() {
+		return 0, nil
+	}
+	if len(l.entries) > 0 && i >= l.offset {
+		return l.entries[i-l.offset].Term, nil
+	}
+	return l.storage.Term(i)
+}
+
+//
+func (l *RaftLog) GetEntries(start uint64) ([]pb.Entry, error) {
+	return l.Slice(start, l.LastIndex()+1)
+}
+
+// [lo, hi)
+func (l *RaftLog) Slice(lo uint64, hi uint64) ([]pb.Entry, error) {
+	li := l.LastIndex()
+	if lo > hi {
+		log.Panicf("Invalid slice [%d, %d)", lo, hi)
+	}
+	if lo > li || hi > li+1 {
+		log.Panicf("lo(%d) idx or hi(%d) idx out of bounds(%d)", lo, hi, li)
+	}
+	if lo == hi {
+		return nil, nil
+	}
+	if len(l.entries) > 0 {
+		var ents []pb.Entry
+		if lo < l.offset {
+			storageEntries, err := l.storage.Entries(lo, min(l.offset, hi))
+			if err != nil {
+				panic(err)
+			}
+			ents = storageEntries
+		}
+		if hi > l.offset {
+			memEntries := l.entries[max(lo, l.offset)-l.offset : hi-l.offset]
+			if len(ents) > 0 {
+				res := make([]pb.Entry, len(ents)+len(memEntries))
+				n := copy(res, ents)
+				copy(res[n:], memEntries)
+				return res, nil
+			} else {
+				res := make([]pb.Entry, len(memEntries))
+				copy(res, memEntries)
+				return res, nil
+			}
+		}
+	} else {
+		storageEntries, err := l.storage.Entries(lo, hi)
+		if err != nil {
+			panic(err)
+		}
+		return storageEntries, nil
+	}
+	return nil, nil
 }
